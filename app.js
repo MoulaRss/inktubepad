@@ -376,8 +376,8 @@
   // LP fee as a fraction. v2 pools have a dynamic fee (anti-snipe): tok.fees comes from
   // currentFees(token), in pips (10_000 = 1%). v1 pools are always 1%.
   function feeOf(tok, isBuy) {
-    const st = isBuy && tok.opts ? v2State(tok) : null;
-    if (st) return st.buyFee / 1e6;
+    const st = tok.opts ? v2State(tok) : null;
+    if (st) return (isBuy ? st.buyFee : st.sellFee) / 1e6;
     return tok.fees ? (isBuy ? tok.fees.buy : tok.fees.sell) / 1e6 : FEE;
   }
   function quoteBuy(tok, eth) {
@@ -401,19 +401,36 @@
     { name: "Off", desc: "Normal 1% fee from the first second." },
     { name: "Standard", desc: "Buy fee starts at 50% and falls to 1% over 2 min. Max 1% of supply per swap for 2 min.", startFee: 500000, dur: 120e3, maxBuy: SUPPLY / 100 },
     { name: "Strong", desc: "Buy fee starts at 80% and falls to 1% over 5 min. Max 0.5% of supply per swap for 5 min.", startFee: 800000, dur: 300e3, maxBuy: SUPPLY / 200 },
+    { name: "Custom", desc: "Your own settings, in seconds." },
   ];
+  const secs = (ms) => { const s = Math.round(ms / 1000); return s < 120 ? `${s} s` : s % 60 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${s / 60} min`; };
+  // Human summary of a pool's on-chain rules (LaunchRules event).
+  function rulesText(g, sym = "") {
+    if (!g || !g.dur) return "Off";
+    return `${pct(g.startFee)} → ${pct(g.buyFee)} buy fee over ${secs(g.dur)}${g.maxBuy && g.buyWin ? ` · max ${fmtNum(g.maxBuy)}${sym ? " " + sym : ""} per buy for ${secs(g.buyWin)}` : ""}`;
+  }
   // Premiere / anti-snipe state of a v2 token right now (null for v1 tokens).
   function v2State(tok, now = Date.now()) {
     const o = tok && tok.opts;
     if (!o) return null;
-    const a = ANTI_SNIPE[o.antiSnipe] || ANTI_SNIPE[0];
+    const preset = ANTI_SNIPE[o.antiSnipe] || ANTI_SNIPE[0];
+    // Exact rules from the LaunchRules event; presets are only a fallback for older v2 pools.
+    const g = o.guard || { dur: preset.dur || 0, startFee: preset.startFee || 10000, buyWin: preset.dur || 0, maxBuy: preset.maxBuy || 0, wlWin: 0, wlCount: 0, buyFee: 10000, sellFee: 10000 };
+    const a = { name: preset.name, dur: g.dur, startFee: g.startFee };
     const premiere = now < o.tradingStart;
-    const snipeEnd = a.dur ? o.tradingStart + a.dur : 0;
+    const snipeEnd = g.dur ? o.tradingStart + g.dur : 0;
     const snipe = !premiere && now < snipeEnd;
+    const wlEnd = g.wlWin ? o.tradingStart + g.wlWin : 0;
+    const whitelist = !premiere && now < wlEnd;
+    const buyWinEnd = o.tradingStart + (g.buyWin || 0);
     // Between two currentFees() reads, interpolate the decaying fee like the hook does.
-    const estFee = snipe ? 10000 + ((a.startFee - 10000) * (snipeEnd - now)) / a.dur : premiere && a.dur ? a.startFee : 10000;
+    const estFee = snipe ? g.buyFee + ((g.startFee - g.buyFee) * (snipeEnd - now)) / g.dur : premiere && g.dur ? g.startFee : g.buyFee;
     const fresh = tok.fees && now - tok.feesAt < 5000;
-    return { premiere, opensIn: o.tradingStart - now, snipe, snipeEnd, preset: a, maxBuy: premiere || snipe ? a.maxBuy || 0 : 0, buyFee: snipe && fresh ? tok.fees.buy : Math.round(estFee) };
+    return {
+      premiere, opensIn: o.tradingStart - now, snipe, snipeEnd, preset: a, guard: g, whitelist, wlEnd,
+      maxBuy: g.maxBuy && (premiere || now < buyWinEnd) ? g.maxBuy : 0,
+      buyFee: fresh ? tok.fees.buy : Math.round(estFee), sellFee: fresh ? tok.fees.sell : g.sellFee,
+    };
   }
   const pct = (pips) => (pips / 1e4).toFixed(pips % 10000 ? 1 : 0) + "%";
   function countdown(ms) {
@@ -500,7 +517,10 @@
     "event Comment(address indexed token,address indexed author,string text)",
     "event FeesCollected(address indexed token,uint256 creatorEth,uint256 creatorTokens,uint256 protocolEth,uint256 protocolTokens)",
     // InkTubeLaunchpadV2 only
-    "function launchWithOptions((string name,string symbol,string image,string description,uint8 mcapTier,uint64 tradingStart,uint8 antiSnipe,uint32 vestingCliff,uint32 vestingDuration,address[] feeRecipients,uint16[] feeBps,uint256 minDevBuyTokens) p) payable returns (address)",
+    "function launchWithOptions((string name,string symbol,string image,string description,uint8 mcapTier,uint64 tradingStart,uint8 antiSnipe,uint32 vestingCliff,uint32 vestingDuration,address[] feeRecipients,uint16[] feeBps,uint256 minDevBuyTokens,uint32 snipeDuration,uint24 snipeStartFee,uint32 maxBuyWindow,uint16 maxBuyBps,uint32 whitelistWindow,address[] whitelist,uint16 buyTaxBps,uint16 sellTaxBps) p) payable returns (address)",
+    "function hook() view returns (address)",
+    "function poolId(address token) view returns (bytes32)",
+    "event LaunchRules(address indexed token,uint32 snipeDuration,uint24 snipeStartFee,uint32 maxBuyWindow,uint96 maxBuyPerSwap,uint32 whitelistWindow,uint256 whitelistCount,uint24 buyFee,uint24 sellFee)",
     "function mcapTiers() view returns (uint256[])",
     "function currentFees(address token) view returns (uint24 buyFee,uint24 sellFee)",
     "function feeSplit(address token) view returns (address[] recipients,uint16[] bps)",
@@ -539,13 +559,16 @@
 
     // Ink ~1s blocks: approximate timestamps from the head block (avoids N getBlock calls).
     const tsOf = (bn) => headTs - (headBlock - bn) * 1000;
-    const EVENTS = ["TokenLaunched", "Trade", "Comment", "LaunchOptions", "FeeSplitUpdated", "VestingClaimed"];
+    const EVENTS = ["TokenLaunched", "Trade", "Comment", "LaunchOptions", "LaunchRules", "FeeSplitUpdated", "VestingClaimed"];
 
     // History comes from the Ink explorer (Blockscout) API: no block-range limit, 1000 logs per call.
     // Public RPCs cap eth_getLogs at 1,000 (rpc-gel) or 10,000 (rpc-qnd) blocks, which would mean
     // hundreds of requests per page load after a few days. The RPC still covers the newest blocks
     // (the explorer can lag a little) and live polling. Duplicates are dropped in ingest().
     const EXPLORER_API = (CFG.EXPLORER_API || CFG.EXPLORER + "/api").replace(/\/$/, "");
+    const POOL_MANAGER = "0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32";
+    const SWAP_TOPIC = E.id("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)");
+    const swapIface = new E.Interface(["event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)"]);
     async function explorerLogs(address, fromBlock, toBlock) {
       const out = [];
       let from = fromBlock, guard = 0;
@@ -618,6 +641,7 @@
     }
 
     const seenLogs = new Set();
+    const rulesBy = new Map(); // token -> LaunchRules, which arrives before TokenLaunched
     function ingest(list, emit) {
       const touched = new Set();
       for (const lg of list) {
@@ -646,10 +670,10 @@
           const sqrt0 = Math.pow(1.0001, Number(a.startTick) / 2);
           const startMcapEth = SUPPLY / (sqrt0 * sqrt0);
           const tok = {
-            address: a.token, name: a.name, symbol: a.symbol, devBuyTokens: toF(a.devBuyTokens),
+            address: a.token, name: a.name, symbol: a.symbol, devBuyTokens: toF(a.devBuyTokens), block: lg.blockNumber,
             creator: a.creator, createdAt: tsOf(lg.blockNumber), startMcapEth, mcapEth: startMcapEth,
             sqrt0, sqrt: sqrt0, L: SUPPLY / sqrt0, trades: [], comments: null,
-            pad, v: pads.get(pad).v,
+            pad, v: pads.get(pad).v, rules: rulesBy.get(lc(a.token)) || null,
           };
           applyMeta(tok, a.image, a.description);
           addToken(tok, emit);
@@ -659,7 +683,21 @@
           tok.opts = {
             startMcapUsd: Number(a.startMcapUsd), tradingStart: Number(a.tradingStart) * 1000, antiSnipe: Number(a.antiSnipe),
             vestingStart: Number(a.vestingStart) * 1000, vestingCliff: Number(a.vestingCliff), vestingDuration: Number(a.vestingDuration),
+            guard: tok.rules || null,
           };
+          if (emit) bus.emit("v2", tok);
+        } else if (ev.name === "LaunchRules") {
+          // Emitted BEFORE TokenLaunched in the launch transaction: keep it until the token is known.
+          const rules = {
+            dur: Number(a.snipeDuration) * 1000, startFee: Number(a.snipeStartFee), buyWin: Number(a.maxBuyWindow) * 1000,
+            maxBuy: toF(a.maxBuyPerSwap), wlWin: Number(a.whitelistWindow) * 1000, wlCount: Number(a.whitelistCount),
+            buyFee: Number(a.buyFee), sellFee: Number(a.sellFee),
+          };
+          rulesBy.set(lc(a.token), rules);
+          const tok = own();
+          if (!tok) continue;
+          tok.rules = rules;
+          if (tok.opts) tok.opts.guard = rules;
           if (emit) bus.emit("v2", tok);
         } else if (ev.name === "FeeSplitUpdated") {
           const tok = own();
@@ -680,6 +718,11 @@
             t: tsOf(lg.blockNumber), isBuy: a.isBuy, eth: toF(a.ethAmount), tokens: toF(a.tokenAmount),
             mcapEth: mcapFromSqrt(sq), trader: a.trader, hash: lg.transactionHash,
           };
+          const dup = tok.trades.find((x) => x.hash === tr.hash);
+          if (dup) {
+            Object.assign(dup, tr, { external: false });
+            continue;
+          }
           tok.trades.push(tr);
           tok.sqrt = sq;
           tok.mcapEth = tr.mcapEth;
@@ -752,9 +795,23 @@
       return c[method](...args, { ...ov, gasLimit: gas + gas / 4n + 20000n });
     }
     // Hook rules are checked here too, so the wallet never opens for a swap that can only revert.
-    function guardTrade(tok, isBuy, tokensOut) {
+    const wlCache = new Map();
+    async function isListed(tok, who) {
+      const p = padOf(tok);
+      if (p.v !== 2 || !who) return false;
+      const k = lc(tok.address) + ":" + lc(who);
+      if (!wlCache.has(k)) {
+        if (!p.hookC) p.hookC = new E.Contract(await p.c.hook(), ["function whitelisted(bytes32,address) view returns (bool)"], rpc);
+        wlCache.set(k, await p.hookC.whitelisted(await p.c.poolId(tok.address), who));
+      }
+      return wlCache.get(k);
+    }
+    async function guardTrade(tok, isBuy, tokensOut) {
       const st = v2State(tok);
       if (!st) return;
+      if (isBuy && st.whitelist && !(await isListed(tok, S.account))) {
+        throw new Error(`Whitelist only: public buying opens in ${countdown(st.wlEnd - Date.now())}`);
+      }
       if (st.premiere) throw new Error(`Premiere: trading opens in ${countdown(st.opensIn)}`);
       if (isBuy && st.maxBuy && tokensOut > st.maxBuy) throw new Error(`Anti-snipe: max ${fmtNum(st.maxBuy)} ${tok.symbol} per buy for now`);
     }
@@ -764,6 +821,9 @@
       mcapTier: form.mcapTier || 0, tradingStart: BigInt(form.tradingStart || 0), antiSnipe: form.antiSnipe || 0,
       vestingCliff: form.vestingCliff || 0, vestingDuration: form.vestingDuration || 0,
       feeRecipients: form.feeRecipients || [], feeBps: form.feeBps || [], minDevBuyTokens: minOut,
+      snipeDuration: form.snipeDuration || 0, snipeStartFee: form.snipeStartFee || 0, maxBuyWindow: form.maxBuyWindow || 0,
+      maxBuyBps: form.maxBuyBps || 0, whitelistWindow: form.whitelistWindow || 0, whitelist: form.whitelist || [],
+      buyTaxBps: form.buyTaxBps || 0, sellTaxBps: form.sellTaxBps || 0,
     });
     let cfgCache = null;
 
@@ -786,6 +846,7 @@
         return await signer.getAddress();
       },
       refresh: refreshMarket,
+      isListed,
       // v2 launch settings: market cap tiers (USD) and launch fee.
       async launchConfig() {
         if (!padV2) return null;
@@ -823,6 +884,35 @@
         ]);
         return { eth: toF(e), tok: toF(t) };
       },
+      // Every swap of the token's Uniswap v4 pool, whatever the router (Uniswap app, aggregators, …),
+      // read from the PoolManager's Swap events through the explorer API. Deduped with InkTube's own Trade events.
+      async poolSwaps(tok) {
+        const p = padOf(tok);
+        if (!tok.poolId) tok.poolId = await p.c.poolId(tok.address);
+        const from = tok.block || p.block;
+        const url = `${EXPLORER_API}?module=logs&action=getLogs&address=${POOL_MANAGER}&fromBlock=${from}&toBlock=latest&topic0=${SWAP_TOPIC}&topic1=${tok.poolId}&topic0_1_opr=and&page=1&offset=1000`;
+        const j = await fetch(url, { headers: { Accept: "application/json" } }).then((r) => r.json());
+        const known = new Set(tok.trades.map((x) => x.hash));
+        let added = 0;
+        for (const x of Array.isArray(j.result) ? j.result : []) {
+          if (known.has(x.transactionHash)) continue;
+          const ev = swapIface.parseLog({ topics: x.topics.filter(Boolean), data: x.data });
+          if (!ev) continue;
+          const a0 = ev.args.amount0, a1 = ev.args.amount1; // swapper's deltas: negative = paid in
+          const isBuy = a0 < 0n;
+          tok.trades.push({
+            t: parseInt(x.timeStamp, 16) * 1000, isBuy, eth: toF(isBuy ? -a0 : a0), tokens: toF(isBuy ? a1 : -a1),
+            mcapEth: mcapFromSqrt(sqrtF(ev.args.sqrtPriceX96)), trader: ev.args.sender, hash: x.transactionHash, external: true,
+          });
+          known.add(x.transactionHash);
+          added++;
+        }
+        if (added) {
+          tok.trades.sort((a, b) => a.t - b.t);
+          await refreshMarket(tok);
+        }
+        return added;
+      },
       async loadComments(tok) {
         const k = lc(tok.address);
         if (!comments.has(k)) comments.set(k, []);
@@ -838,7 +928,7 @@
       async buy(tok, eth, minOut) {
         await ensureSigner();
         await refreshMarket(tok);
-        guardTrade(tok, true, quoteBuy(tok, eth).out);
+        await guardTrade(tok, true, quoteBuy(tok, eth).out);
         const tx = await send(sPad(tok), "buy", [tok.address, toWei(minOut)], { value: toWei(eth) });
         toast("Transaction sent…", tx.hash);
         await tx.wait();
@@ -846,7 +936,7 @@
       },
       async sell(tok, amt, minOut) {
         await ensureSigner();
-        guardTrade(tok, false);
+        await guardTrade(tok, false);
         const me = await signer.getAddress();
         const spender = padOf(tok).address;
         const erc = new E.Contract(tok.address, ERC20_ABI, signer);
@@ -1205,6 +1295,14 @@
     return out.map((c) => ({ ...c, o: usd(c.o), h: usd(c.h), l: usd(c.l), c: usd(c.c) }));
   }
 
+  function fmtAxis(v, span) {
+    if (!(span > 0)) return fmtUsd(v);
+    const unit = v >= 1e6 ? 1e6 : v >= 1e3 ? 1e3 : 1, suf = unit === 1e6 ? "M" : unit === 1e3 ? "K" : "";
+    const step = span / 4 / unit;
+    const dec = step >= 10 ? 0 : step >= 1 ? 1 : step >= 0.1 ? 2 : 3;
+    return "$" + (v / unit).toFixed(dec) + suf;
+  }
+
   class Chart {
     constructor(canvas, tip) {
       this.c = canvas;
@@ -1229,8 +1327,9 @@
         this.draw();
       });
     }
-    set(data, animate) {
+    set(data, animate, emptyText = "") {
       this.data = data;
+      this.emptyText = emptyText;
       if (animate) {
         this.anim = 0;
         const t0 = performance.now();
@@ -1259,7 +1358,17 @@
       bg.addColorStop(1, "rgba(0,0,0,0)");
       ctx.fillStyle = bg;
       ctx.fillRect(0, 0, W, H);
-      if (!d.length) return;
+      const note = () => {
+        if (!this.emptyText) return;
+        ctx.save();
+        ctx.font = "500 14px Roboto, Arial";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = "rgba(255,255,255,.6)";
+        ctx.fillText(this.emptyText, W / 2, H / 2 - 10);
+        ctx.restore();
+      };
+      if (!d.length) return note();
 
       const compact = H < 320;
       const padL = 12, padR = compact ? 58 : 70, padT = compact ? 64 : 78, padB = compact ? 34 : 64;
@@ -1281,7 +1390,23 @@
         ctx.strokeStyle = "rgba(255,255,255,.06)";
         ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(W - padR, yy); ctx.stroke();
         ctx.fillStyle = "rgba(255,255,255,.5)";
-        ctx.fillText(fmtUsd(v), W - padR + 8, yy);
+        ctx.fillText(fmtAxis(v, hi - lo), W - padR + 8, yy);
+      }
+      // time axis
+      if (d.length > 1) {
+        const span = d[d.length - 1].t - d[0].t;
+        const fmtT = (ms) => {
+          const dt = new Date(ms);
+          return span > 2 * 864e5 ? dt.toLocaleDateString("en-US", { month: "short", day: "numeric" }) : dt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+        };
+        ctx.textAlign = "center";
+        ctx.fillStyle = "rgba(255,255,255,.4)";
+        const n = Math.min(5, d.length);
+        for (let i = 0; i < n; i++) {
+          const idx = Math.round(((d.length - 1) * (i + 0.5)) / n);
+          ctx.fillText(fmtT(d[idx].t), x(idx), padT + ch + 14);
+        }
+        ctx.textAlign = "left";
       }
 
       ctx.save();
@@ -1321,6 +1446,7 @@
       }
       ctx.restore();
 
+      note();
       // last price line
       const last = d[d.length - 1].c, ly = y(last);
       ctx.setLineDash([4, 4]);
@@ -1424,11 +1550,13 @@
     InvalidParams: "Invalid parameters", InvalidFeeSplit: "Invalid fee split", InsufficientFee: "Launch fee not covered",
     UnknownToken: "Unknown token", NotCreator: "Only the token creator can do this",
     TradingNotStarted: "Premiere: trading has not opened yet", MaxBuyExceeded: "Anti-snipe: this buy is above the max per swap for now",
+    WhitelistOnly: "Whitelist only: your wallet is not on this token's whitelist yet",
+    InvalidGuard: "These anti-snipe, whitelist or tax settings are outside the allowed limits", AlreadyRegistered: "Pool rules are already set",
   };
   const ERR_IFACE = window.ethers
     ? new window.ethers.Interface([
-        ...Object.keys(ERR_TEXT).filter((k) => !["TradingNotStarted", "MaxBuyExceeded"].includes(k)).map((k) => `error ${k}()`),
-        "error TradingNotStarted(uint64 tradingStart)", "error MaxBuyExceeded(uint256 maxBuyPerSwap)",
+        ...Object.keys(ERR_TEXT).filter((k) => !["TradingNotStarted", "MaxBuyExceeded", "WhitelistOnly"].includes(k)).map((k) => `error ${k}()`),
+        "error TradingNotStarted(uint64 tradingStart)", "error MaxBuyExceeded(uint256 maxBuyPerSwap)", "error WhitelistOnly(uint256 publicFrom)",
         "error WrappedError(address target,bytes4 selector,bytes reason,bytes details)",
       ])
     : null;
@@ -1969,6 +2097,7 @@
         </div>
         ${v2 ? `<div class="v2-box" id="v2-box" hidden></div>` : ""}
 
+        ${isCreator ? listingPanel(t) : ""}
         <div class="desc" id="desc">
           <div class="head"><span id="d-trades">${fmtCount(st.trades)} trade${st.trades === 1 ? "" : "s"}</span><span>Launched ${ago(t.createdAt)}</span><span style="color:var(--ink-3)">#${esc(t.symbol)}${t.category ? ` #${CATS[t.category]}` : ""} #Ink</span></div>
           <div class="text">${esc(t.description || "No description.")}</div>
@@ -2028,6 +2157,12 @@
     renderFeed();
     renderTrade();
     loadComments(t);
+    if (API.poolSwaps) {
+      const pull = () => API.poolSwaps(t).then((n) => { if (n && W.tok === t) { refreshWatch(false); renderFeed(true); } }).catch((e) => console.warn("pool swaps:", e.message));
+      pull();
+      const sw = setInterval(pull, 20000);
+      onCleanup(() => clearInterval(sw));
+    }
     if (!t.feeTo && API.feeRecipient) API.feeRecipient(t).then((r) => { if (r) { t.feeTo = r; if (W.tok === t) refreshWatch(false); } }).catch(() => {});
     if (v2) loadV2(t);
     let phase = v2Phase(t), lastFeeRead = 0;
@@ -2053,6 +2188,106 @@
     tick();
     const timer = setInterval(tick, 1000);
     onCleanup(() => clearInterval(timer));
+  }
+
+  // ---------------- Listing kit: logo, header and links for DexScreener / GeckoTerminal ----------------
+  // Trading terminals (Axiom, Photon, …) don't read InkTube's on-chain metadata: they show the logo and
+  // socials indexed by DexScreener / GeckoTerminal. This panel gives the creator everything to submit.
+  function listingPanel(t) {
+    const dex = `https://marketplace.dexscreener.com/product/token-info/order?chainId=ink&tokenAddress=${t.address}`;
+    const gt = `https://www.geckoterminal.com/ink/tokens/${t.address}`;
+    return `<div class="list-kit" id="list-kit">
+      <div class="lk-h">${I.ext}<div><b>Show your logo and links on Axiom, DexScreener and other terminals</b>
+        <span>Trading terminals take token logos and socials from DexScreener and GeckoTerminal, not from the blockchain. Submit them once for this token.</span></div></div>
+      <div class="lk-row">
+        <button class="btn" data-act="lk-logo">${I.image}Logo 512×512</button>
+        <button class="btn" data-act="lk-header">${I.image}Header 1500×500</button>
+        <button class="btn" data-act="lk-copy">${I.copy}Copy token info</button>
+      </div>
+      <div class="lk-row">
+        <a class="btn ink" href="${esc(dex)}" target="_blank" rel="noopener">${I.ext}Submit on DexScreener</a>
+        <a class="btn" href="${esc(gt)}" target="_blank" rel="noopener">${I.ext}GeckoTerminal (free, “Update info”)</a>
+      </div>
+      <div class="muted lk-note">DexScreener's Enhanced Token Info is paid and shows up within minutes. GeckoTerminal's form is free but reviewed by hand. Both ask for a square logo, a 3:1 header and your links.</div>
+    </div>`;
+  }
+  function loadImg(src) {
+    return new Promise((res, rej) => {
+      const im = new Image();
+      im.crossOrigin = "anonymous";
+      im.onload = () => res(im);
+      im.onerror = () => rej(new Error("Image could not be loaded"));
+      im.src = src;
+    });
+  }
+  function drawCover(ctx, im, x, y, w, h) {
+    const r = Math.max(w / im.width, h / im.height), sw = w / r, sh = h / r;
+    ctx.drawImage(im, (im.width - sw) / 2, (im.height - sh) / 2, sw, sh, x, y, w, h);
+  }
+  function saveCanvas(c, name) {
+    return new Promise((res, rej) => {
+      try {
+        c.toBlob((b) => {
+          if (!b) return rej(new Error("Export failed"));
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(b);
+          a.download = name;
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
+          res();
+        }, "image/png");
+      } catch (e) {
+        rej(e);
+      }
+    });
+  }
+  async function downloadLogo(t) {
+    const c = document.createElement("canvas");
+    c.width = c.height = 512;
+    drawCover(c.getContext("2d"), await loadImg(t.image), 0, 0, 512, 512);
+    await saveCanvas(c, `${t.symbol}-logo-512.png`);
+  }
+  async function downloadHeader(t) {
+    const c = document.createElement("canvas");
+    c.width = 1500;
+    c.height = 500;
+    const ctx = c.getContext("2d");
+    if (t.banner) {
+      drawCover(ctx, await loadImg(t.banner), 0, 0, 1500, 500);
+    } else {
+      const g = ctx.createLinearGradient(0, 0, 1500, 500);
+      g.addColorStop(0, "#2a1260");
+      g.addColorStop(1, "#0b0712");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 1500, 500);
+      const logo = await loadImg(t.image);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(250, 250, 150, 0, Math.PI * 2);
+      ctx.clip();
+      drawCover(ctx, logo, 100, 100, 300, 300);
+      ctx.restore();
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "700 92px Roboto, Arial, sans-serif";
+      ctx.fillText(t.name.slice(0, 22), 470, 245);
+      ctx.fillStyle = "#c4b5fd";
+      ctx.font = "500 54px Roboto, Arial, sans-serif";
+      ctx.fillText("$" + t.symbol, 470, 320);
+      ctx.fillStyle = "#a1a1aa";
+      ctx.font = "400 30px Roboto, Arial, sans-serif";
+      ctx.fillText("Launched on InkTube · inktubepad.fun", 470, 385);
+    }
+    await saveCanvas(c, `${t.symbol}-header-1500x500.png`);
+  }
+  function tokenInfoText(t) {
+    const L = t.links || {};
+    return [
+      `Name: ${t.name}`, `Symbol: ${t.symbol}`, "Chain: Ink (57073)", `Contract: ${t.address}`,
+      t.description ? `Description: ${t.description}` : "",
+      L.w ? `Website: ${L.w}` : "", L.x ? `X / Twitter: ${L.x}` : "", L.tg ? `Telegram: ${L.tg}` : "", L.dc ? `Discord: ${L.dc}` : "",
+      `InkTube page: https://inktubepad.fun/#/watch/${t.address}`,
+    ].filter(Boolean).join("\n");
   }
 
   // ---------------- v2 token page: Premiere, anti-snipe, vesting ----------------
@@ -2089,6 +2324,8 @@
     if (bn) {
       const html = st && st.premiere
         ? `<b>${I.live}Premiere</b><span>Trading opens in <b>${countdown(st.opensIn)}</b>. Buys and sells are blocked on-chain until then.</span>`
+        : st && st.whitelist
+          ? `<b>${I.person}Whitelist only</b><span>Only listed wallets can buy for <b>${countdown(st.wlEnd - Date.now())}</b>. Selling is open to everyone.</span>`
         : st && st.snipe
           ? `<b>${I.lock}Anti-snipe: ${pct(st.buyFee)} buy fee</b><span>Falls to 1% in <b>${countdown(st.snipeEnd - Date.now())}</b>${st.maxBuy ? ` · max ${fmtNum(st.maxBuy)} ${esc(t.symbol)} per buy` : ""}. Sells pay 1%.</span>`
           : "";
@@ -2131,7 +2368,17 @@
     if (!t || !currentChart) return;
     if (t.ext) return refreshExtWatch(animate);
     const st = stats(t);
-    if (!W.paused) currentChart.set(buildCandles(t, TF[W.tf][1]), animate);
+    if (!W.paused) {
+      const cs = buildCandles(t, TF[W.tf][1]);
+      // The pool price is the truth (trades through other routers move it too).
+      if (cs.length) {
+        const last = cs[cs.length - 1], v = usd(t.mcapEth);
+        last.c = v;
+        last.h = Math.max(last.h, v);
+        last.l = Math.min(last.l, v);
+      }
+      currentChart.set(cs, animate, t.trades.length ? "" : "No trades yet · the first buy starts the chart");
+    }
     $("#w-mc").textContent = fmtUsd(usd(t.mcapEth));
     $("#w-chg").innerHTML = `<span class="${st.changeAll >= 0 ? "up" : "down"}">${fmtPct(st.changeAll)}</span> since launch · price ${fmtTiny(usd(t.mcapEth) / SUPPLY)}`;
     $("#d-trades").textContent = `${fmtCount(st.trades)} trade${st.trades === 1 ? "" : "s"}`;
@@ -2163,7 +2410,10 @@
       out.push(["Market cap tier", fmtUsd(o.startMcapUsd)]);
       const sched = o.tradingStart - t.createdAt > 60e3;
       if (sched || st.premiere) out.push([st.premiere ? "Premiere" : "Trading opened", fmtDate(o.tradingStart)]);
-      out.push(["Anti-snipe", o.antiSnipe ? `${ANTI_SNIPE[o.antiSnipe].name}${st.snipe ? ` · <span class="down">active now</span>` : st.premiere ? "" : " · ended"}` : "Off"]);
+      const g = st.guard;
+      out.push(["Taxes", `<span class="${g.buyFee > 50000 || g.sellFee > 50000 ? "down" : ""}">Buy ${pct(g.buyFee)} · sell ${pct(g.sellFee)}</span> · fixed`]);
+      out.push(["Anti-snipe", o.antiSnipe ? `${ANTI_SNIPE[o.antiSnipe].name} · ${esc(rulesText(g, t.symbol))}${st.snipe ? ` · <span class="down">active now</span>` : st.premiere ? "" : " · ended"}` : "Off"]);
+      if (g.wlWin) out.push(["Whitelist", `${g.wlCount} wallet${g.wlCount > 1 ? "s" : ""} · first ${secs(g.wlWin)}${st.whitelist ? ` · <span class="down">active now</span>` : st.premiere ? "" : " · ended"}`]);
       if (t.vest && t.vest.total) {
         const vn = vestNow(t.vest);
         out.push(["Creator buy vesting", `until ${fmtDate(vn.end)}${t.vest.cliff ? ` (cliff ${fmtDays(t.vest.cliff)})` : ""}`]);
@@ -2300,13 +2550,22 @@
       animate = true;
     }
     const cs = W.extCandles;
+    if (!cs.length && !W.extRetry) {
+      W.extRetry = setTimeout(() => {
+        W.extRetry = null;
+        if (W.tok === t && currentChart) {
+          W.extCandles = null;
+          refreshExtWatch(true);
+        }
+      }, 20000);
+    }
     if (cs.length) {
       const last = cs[cs.length - 1], v = usd(t.mcapEth);
       last.c = v;
       last.h = Math.max(last.h, v);
       last.l = Math.min(last.l, v);
     }
-    if (!W.paused) currentChart.set(cs, animate);
+    if (!W.paused) currentChart.set(cs, animate, cs.length ? "" : "Price history unavailable right now · retrying…");
     const st = stats(t);
     const price = fmtTiny(usd(t.mcapEth) / t.supply);
     $("#w-mc").textContent = fmtUsd(usd(t.mcapEth));
@@ -2505,6 +2764,8 @@
       links: {}, devBuy: 0, protect: true, feeMode: "me", feeTo: "", pinned: "",
       // v2 launch options
       mcapTier: 0, premiere: false, premiereAt: "", antiSnipe: 0, vest: false, cliffDays: "0", vestDays: "30",
+      snipeSec: "60", snipeFeePct: "30", buyWinSec: "60", maxBuyPct: "0.5",
+      wl: false, wlSec: "60", wlText: "", buyTax: "1", sellTax: "1",
       split: [{ addr: S.account, pct: "100" }],
     };
     const wz = (openUpload.wz = { step: 0, maxStep: 0, f, est: null, estKey: "", cfg: null });
@@ -2552,7 +2813,7 @@
     const f = openUpload.wz.f, d = wzDerived();
     if (step === 0) return f.name.trim() && f.name.length <= 64 && f.symbol && f.symbol.length <= 16 && d.descBytes <= 1000 && d.imgBytes <= IMG_BUDGET;
     if (step === 1) return !d.badLinks.length;
-    if (step === 2 && API.v2) return f.devBuy >= 0 && !d.premErr && !d.vestErr && !d.splitErr && f.pinned.length <= 280;
+    if (step === 2 && API.v2) return f.devBuy >= 0 && !d.premErr && !d.vestErr && !d.splitErr && !d.snipeErr && !d.wlErr && !d.taxErr && f.pinned.length <= 280;
     if (step === 2) return f.devBuy >= 0 && d.feeToValid && f.pinned.length <= 280;
     return [0, 1, 2].every(wzValid) && openUpload.wz.est && openUpload.wz.est.ok;
   }
@@ -2579,6 +2840,32 @@
       if (!(r.bps > 0)) { splitErr = "Each recipient needs a share above 0%"; break; }
     }
     if (!splitErr && sum !== 10000) splitErr = `Shares must add up to 100% (now ${+(sum / 100).toFixed(2)}%)`;
+    // Custom anti-snipe, in seconds (the hook caps: 600 s, 80%).
+    const custom = f.antiSnipe === 3;
+    const snSec = Math.round(num(f.snipeSec)), snFee = Math.round(num(f.snipeFeePct) * 1e4);
+    const bwSec = Math.round(num(f.buyWinSec)), mbBps = Math.round(num(f.maxBuyPct) * 100);
+    // Taxes: 1% to 10% each, fixed forever.
+    const buyBps = Math.round(num(f.buyTax) * 100), sellBps = Math.round(num(f.sellTax) * 100);
+    const taxErr = !(buyBps >= 100 && buyBps <= 1000) ? "Buy tax: 1% to 10%" : !(sellBps >= 100 && sellBps <= 1000) ? "Sell tax: 1% to 10%" : "";
+    const snipeErr = !custom ? ""
+      : !(snSec >= 0 && snSec <= 600) ? "Fee duration: 0 to 600 seconds"
+      : snSec > 0 && !(snFee >= Math.max(10000, buyBps * 100) && snFee <= 800000) ? `Starting buy fee: ${Math.max(1, buyBps / 100)}% (your buy tax) to 80%`
+      : !(bwSec >= 0 && bwSec <= 600) ? "Max-buy window: 0 to 600 seconds"
+      : !(mbBps >= 0 && mbBps <= 10000) ? "Max buy: 0% to 100% of supply"
+      : snSec === 0 && !(bwSec > 0 && mbBps > 0) ? "Set a fee duration or a max buy (or pick Off)" : "";
+    // Whitelist: wallets that can buy during the first seconds (the hook caps: 1800 s, 500 wallets).
+    const wlAddrs = f.wl ? [...new Set(String(f.wlText).split(/[\s,;]+/).map((x) => x.trim()).filter(Boolean).map(lc))] : [];
+    const wlBad = wlAddrs.filter((x) => !isAddr(x));
+    const wlSec = Math.round(num(f.wlSec));
+    const wlErr = !f.wl ? "" : !wlAddrs.length ? "Add at least one wallet address" : wlBad.length ? `Invalid address: ${wlBad[0].slice(0, 16)}…`
+      : wlAddrs.length > 500 ? "500 wallets max" : !(wlSec >= 1 && wlSec <= 1800) ? "Whitelist period: 1 to 1800 seconds" : "";
+    const rulesPreview = custom
+      ? { dur: snSec * 1000, startFee: snSec ? snFee : 0, buyWin: bwSec * 1000, maxBuy: mbBps ? (SUPPLY * mbBps) / 1e4 : 0, buyFee: buyBps * 100 }
+      : { ...(ANTI_SNIPE[f.antiSnipe] || {}), buyWin: (ANTI_SNIPE[f.antiSnipe] || {}).dur || 0, buyFee: buyBps * 100 };
+    const extra = {
+      custom, snSec, snFee, bwSec, mbBps, snipeErr, rulesPreview,
+      wlOn: f.wl, wlAddrs, wlSec, wlErr, buyBps, sellBps, taxErr,
+    };
     // Just me at 100% = the contract default (empty arrays).
     const meOnly = rows.length === 1 && lc(rows[0].addr) === lc(S.account);
     return {
@@ -2586,6 +2873,7 @@
       vestOn, vestCliff: vc, vestDur: vd, vestErr,
       splitRows: rows, splitSum: sum, splitErr,
       feeRecipients: splitErr || meOnly ? [] : rows.map((r) => r.addr), feeBps: splitErr || meOnly ? [] : rows.map((r) => r.bps),
+      ...extra,
     };
   }
 
@@ -2625,7 +2913,34 @@
         <div class="opt">
           <div class="opt-h">${I.lock}<div><b>Anti-snipe</b><span>Makes bots pay for buying in the first minutes. Enforced by the pool's hook for every router.</span></div></div>
           <div class="seg-pick">${ANTI_SNIPE.map((a, i) => `<button class="chip ${f.antiSnipe === i ? "active" : ""}" data-act="wz-snipe" data-i="${i}">${a.name}</button>`).join("")}</div>
-          <div class="muted opt-note">${esc(ANTI_SNIPE[f.antiSnipe].desc)}${f.antiSnipe ? " Honest early buyers pay this fee too; it goes to the locked LP (80% to your fee recipients)." : ""}</div>
+          ${d.custom ? `<div class="two-in">
+            <div class="field-box"><label>Fee duration (seconds, max 600)</label><input id="f-sn" inputmode="numeric" value="${esc(f.snipeSec)}"></div>
+            <div class="field-box"><label>Starting buy fee (%, max 80)</label><input id="f-sf" inputmode="decimal" value="${esc(f.snipeFeePct)}"></div>
+          </div>
+          <div class="two-in">
+            <div class="field-box"><label>Max-buy window (seconds, max 600)</label><input id="f-bw" inputmode="numeric" value="${esc(f.buyWinSec)}"></div>
+            <div class="field-box"><label>Max buy per swap (% of supply, 0 = none)</label><input id="f-mb" inputmode="decimal" value="${esc(f.maxBuyPct)}"></div>
+          </div>
+          <div class="presets">${[15, 30, 60, 120, 300, 600].map((v) => `<button data-act="wz-snsec" data-v="${v}">${v < 60 ? v + " s" : v / 60 + " min"}</button>`).join("")}</div>
+          ${d.snipeErr ? `<div class="wz-warn">⚠ ${esc(d.snipeErr)}</div>` : `<div class="muted opt-note">${esc(rulesText(d.rulesPreview, f.symbol))}. Honest early buyers pay this fee too; it goes to the locked LP.</div>`}`
+          : `<div class="muted opt-note">${esc(ANTI_SNIPE[f.antiSnipe].desc)}${f.antiSnipe ? " Honest early buyers pay this fee too; it goes to the locked LP (80% to your fee recipients)." : ""}</div>`}
+        </div>
+        <div class="opt">
+          <div class="opt-h">${I.person}<div><b>Whitelist</b><span>Right after trading opens, only the wallets you list can buy, for the number of seconds you choose. They skip the anti-snipe fee. Selling stays open to everyone.</span></div></div>
+          <label class="tog"><input type="checkbox" id="f-wl" ${f.wl ? "checked" : ""}><span></span>Enable a whitelist</label>
+          ${f.wl ? `<div class="field-box"><label>Whitelist-only period (seconds, max 1800)</label><input id="f-wls" inputmode="numeric" value="${esc(f.wlSec)}"></div>
+            <div class="presets">${[30, 60, 120, 300, 900, 1800].map((v) => `<button data-act="wz-wlsec" data-v="${v}">${v < 60 ? v + " s" : v / 60 + " min"}</button>`).join("")}</div>
+            <div class="field-box"><label>Wallets, one per line (max 500) · ${d.wlAddrs.length - (d.wlErr && /Invalid/.test(d.wlErr) ? 1 : 0)} listed</label><textarea id="f-wlt" class="mono" placeholder="0x…&#10;0x…" style="min-height:96px">${esc(f.wlText)}</textarea></div>
+            ${d.wlErr ? `<div class="wz-warn">⚠ ${esc(d.wlErr)}</div>` : `<div class="muted opt-note">Checked on the wallet that signs the buy, through any app or router. Smart-contract wallets (Safe, smart accounts) can't use it.</div>`}` : ""}
+        </div>
+        <div class="opt">
+          <div class="opt-h">${I.coin}<div><b>Taxes</b><span>Fixed buy and sell fees, 1% to 10%, set forever at launch (nobody can change them later). They go to the locked LP fees: 80% to your fee recipients, 20% to InkTube.</span></div></div>
+          <div class="two-in">
+            <div class="field-box"><label>Buy tax (%)</label><input id="f-bt" inputmode="decimal" value="${esc(f.buyTax)}"></div>
+            <div class="field-box"><label>Sell tax (%)</label><input id="f-st" inputmode="decimal" value="${esc(f.sellTax)}"></div>
+          </div>
+          <div class="presets">${[[1, 1], [2, 2], [3, 3], [5, 5], [3, 5], [10, 10]].map(([b, s_]) => `<button data-act="wz-tax" data-b="${b}" data-s="${s_}">${b}% / ${s_}%</button>`).join("")}</div>
+          ${d.taxErr ? `<div class="wz-warn">⚠ ${esc(d.taxErr)}</div>` : d.buyBps > 500 || d.sellBps > 500 ? `<div class="wz-warn">⚠ Taxes above 5% are shown on your page and scare many buyers and bots-checkers.</div>` : `<div class="muted opt-note">${d.buyBps === 100 && d.sellBps === 100 ? "1% / 1% is the default, like every v1 token." : `Buyers pay ${d.buyBps / 100}%, sellers ${d.sellBps / 100}%, shown on your token page.`}</div>`}
         </div>
         <div class="opt">
           <div class="opt-h">${I.wallet}<div><b>Creator fees</b><span>80% of the LP fees go to these addresses, forever. You can change the split later from the contract.</span></div></div>
@@ -2678,13 +2993,13 @@
         <div class="field-box"><label>Name (required)</label><input id="f-name" maxlength="64" placeholder="e.g. Inky the Squid" value="${esc(f.name)}"><span class="cnt">${f.name.length}/64</span></div>
         <div class="field-box"><label>Ticker (required)</label><input id="f-sym" maxlength="16" placeholder="e.g. INKY" style="text-transform:uppercase" value="${esc(f.symbol)}"><span class="cnt">${f.symbol.length}/16</span></div>
         ${d.dupTicker ? `<div class="wz-warn">⚠ $${esc(f.symbol)} already exists on Ink. You can still use it, but a unique ticker is easier to find.</div>` : ""}
-        <div class="field-box"><label>Description</label><textarea id="f-text" placeholder="Tell viewers about your token">${esc(f.text)}</textarea>
+        <div class="field-box"><label>Description (optional)</label><textarea id="f-text" placeholder="Tell viewers about your token">${esc(f.text)}</textarea>
           <span class="cnt ${d.descBytes > 1000 ? "down" : ""}">${Math.max(0, 1000 - d.descBytes)} bytes left</span></div>
-        <div class="wz-label">Category</div>
+        <div class="wz-label">Category <span class="muted">optional</span></div>
         <div class="cat-pick">${Object.entries(CATS).map(([k, l]) => `<button class="chip ${f.category === k ? "active" : ""}" data-act="wz-cat" data-cat="${k}">${l}</button>`).join("")}</div>
         <div class="wz-label">Images <span class="muted">stored on-chain · ${(d.imgBytes / 1024).toFixed(1)} / ${(IMG_BUDGET / 1024).toFixed(0)} KB</span></div>
         <div class="img-pick">
-          <div><div class="drop sq" data-act="wz-pick" data-kind="logo">${d.logo ? `<img src="${esc(d.logo.startsWith("ipfs://") ? CFG.IPFS_GATEWAY + d.logo.slice(7) : d.logo)}" alt="">` : `${I.image}<span>Logo<br><small>square · avatar</small></span>`}</div>
+          <div><div class="drop sq" data-act="wz-pick" data-kind="logo">${d.logo ? `<img src="${esc(d.logo.startsWith("ipfs://") ? CFG.IPFS_GATEWAY + d.logo.slice(7) : d.logo)}" alt="">` : `${I.image}<span>Logo (optional)<br><small>square · avatar</small></span>`}</div>
             <input class="url-in" id="f-logo-url" placeholder="…or logo URL (https / ipfs)" value="${esc(f.logoUrl)}"></div>
           <div><div class="drop wide" data-act="wz-pick" data-kind="banner">${d.banner ? `<img src="${esc(d.banner.startsWith("ipfs://") ? CFG.IPFS_GATEWAY + d.banner.slice(7) : d.banner)}" alt="">` : `${I.image}<span>Thumbnail 16:9<br><small>optional · shown on cards</small></span>`}</div>
             <input class="url-in" id="f-banner-url" placeholder="…or thumbnail URL (https / ipfs)" value="${esc(f.bannerUrl)}"></div>
@@ -2695,7 +3010,7 @@
       pane.innerHTML = `
         <div class="wz-h">Links</div>
         <p class="muted" style="margin:-6px 0 16px">Shown under your token's description, like the links of a YouTube video. All optional.</p>
-        ${LINK_KINDS.map(([k, l, ic, ph]) => `<div class="field-box link-box ${f.links[k] && !d.links[k] ? "err" : ""}"><label>${l}</label>
+        ${LINK_KINDS.map(([k, l, ic, ph]) => `<div class="field-box link-box ${f.links[k] && !d.links[k] ? "err" : ""}"><label>${l} (optional)</label>
           <div class="lb">${I[ic]}<input data-link="${k}" placeholder="${ph}" value="${esc(f.links[k] || "")}"></div></div>`).join("")}
         ${d.badLinks.length ? `<div class="wz-warn">⚠ Invalid link: ${d.badLinks.join(", ")}. Use a full https:// address.</div>` : ""}`;
     } else if (wz.step === 2 && API.v2) {
@@ -2739,7 +3054,9 @@
           ${API.v2 ? check(true, "Starting market cap", fmtUsd(d.tierUsd)) : ""}
           ${check(true, "Creator buy", f.devBuy > 0 ? `${f.devBuy} ETH → ${d.devPct.toFixed(2)}% of supply${f.protect ? " · protected" : ""}${d.vestOn ? ` · vesting ${fmtDays(d.vestDur)}${d.vestCliff ? `, cliff ${fmtDays(d.vestCliff)}` : ""}` : ""}` : "None")}
           ${API.v2 ? check(!d.premErr, "Trading", d.tradingStart ? `Premiere: opens ${esc(fmtDate(d.premAt))}` : d.premErr ? esc(d.premErr) : "Opens right away") : ""}
-          ${API.v2 ? check(true, "Anti-snipe", `${ANTI_SNIPE[f.antiSnipe].name}${f.antiSnipe ? ` · ${esc(ANTI_SNIPE[f.antiSnipe].desc)}` : ""}`) : ""}
+          ${API.v2 ? check(true, "Anti-snipe", `${ANTI_SNIPE[f.antiSnipe].name}${f.antiSnipe ? ` · ${esc(d.custom ? rulesText(d.rulesPreview, f.symbol) : ANTI_SNIPE[f.antiSnipe].desc)}` : ""}`) : ""}
+          ${API.v2 ? check(true, "Whitelist", d.wlOn ? `${d.wlAddrs.length} wallet${d.wlAddrs.length > 1 ? "s" : ""} only, for ${secs(d.wlSec * 1000)} after trading opens` : "None") : ""}
+          ${API.v2 ? check(d.buyBps <= 500 && d.sellBps <= 500, "Taxes", `Buy ${d.buyBps / 100}% · sell ${d.sellBps / 100}% · fixed forever`, true) : ""}
           ${API.v2
             ? check(true, d.splitRows.length > 1 ? "Creator fees split" : "Creator fees go to", d.splitRows.map((r) => `<span class="mono">${esc(short(r.addr))}</span> ${+(r.bps / 100).toFixed(2)}%`).join(" · "))
             : check(true, "Creator fees go to", d.feeTo ? `<span class="mono">${esc(short(d.feeTo))}</span>` : `Your wallet <span class="mono">${short(S.account)}</span>`)}
@@ -2791,6 +3108,15 @@
     $$('input[name="feemode"]').forEach((el) => el.addEventListener("change", () => { f.feeMode = el.value; wzRender(); }));
     on("#f-feeto", (e) => { f.feeTo = e.target.value; rerenderSoon(); wzSoft(); });
     on("#f-vest", (e) => { f.vest = e.target.checked; wzRender(); }, "change");
+    on("#f-sn", (e) => { f.snipeSec = e.target.value; rerenderSoon(); wzSoft(); });
+    on("#f-sf", (e) => { f.snipeFeePct = e.target.value; rerenderSoon(); wzSoft(); });
+    on("#f-bw", (e) => { f.buyWinSec = e.target.value; rerenderSoon(); wzSoft(); });
+    on("#f-mb", (e) => { f.maxBuyPct = e.target.value; rerenderSoon(); wzSoft(); });
+    on("#f-wl", (e) => { f.wl = e.target.checked; wzRender(); }, "change");
+    on("#f-wls", (e) => { f.wlSec = e.target.value; rerenderSoon(); wzSoft(); });
+    on("#f-wlt", (e) => { f.wlText = e.target.value; rerenderSoon(); wzSoft(); });
+    on("#f-bt", (e) => { f.buyTax = e.target.value; rerenderSoon(); wzSoft(); });
+    on("#f-st", (e) => { f.sellTax = e.target.value; rerenderSoon(); wzSoft(); });
     on("#f-cliff", (e) => { f.cliffDays = e.target.value; rerenderSoon(); wzSoft(); });
     on("#f-vdays", (e) => { f.vestDays = e.target.value; rerenderSoon(); wzSoft(); });
     $$('input[name="premmode"]').forEach((el) => el.addEventListener("change", () => {
@@ -2852,6 +3178,10 @@
     mcapTier: f.mcapTier, tradingStart: d.tradingStart, antiSnipe: f.antiSnipe,
     vestingCliff: d.vestOn ? d.vestCliff : 0, vestingDuration: d.vestOn ? d.vestDur : 0,
     feeRecipients: d.feeRecipients, feeBps: d.feeBps,
+    snipeDuration: d.custom ? d.snSec : 0, snipeStartFee: d.custom && d.snSec ? d.snFee : 0,
+    maxBuyWindow: d.custom ? d.bwSec : 0, maxBuyBps: d.custom ? d.mbBps : 0,
+    whitelistWindow: d.wlOn ? d.wlSec : 0, whitelist: d.wlOn ? d.wlAddrs : [],
+    buyTaxBps: d.buyBps === 100 ? 0 : d.buyBps, sellTaxBps: d.sellBps === 100 ? 0 : d.sellBps,
   });
 
   function closeModal() {
@@ -2989,6 +3319,23 @@
         case "wz-dev": openUpload.wz.f.devBuy = +a.dataset.v; return wzRender();
         case "wz-tier": openUpload.wz.f.mcapTier = +a.dataset.i; return wzRender();
         case "wz-snipe": openUpload.wz.f.antiSnipe = +a.dataset.i; return wzRender();
+        case "wz-snsec": Object.assign(openUpload.wz.f, { snipeSec: a.dataset.v, buyWinSec: a.dataset.v }); return wzRender();
+        case "wz-wlsec": openUpload.wz.f.wlSec = a.dataset.v; return wzRender();
+        case "lk-logo":
+        case "lk-header": {
+          const t = W.tok;
+          try {
+            await (act === "lk-logo" ? downloadLogo(t) : downloadHeader(t));
+          } catch (err) {
+            toast("This image is hosted on another site and can't be converted here: open it and save it instead");
+            window.open(act === "lk-logo" ? t.image : t.banner || t.image, "_blank", "noopener");
+          }
+          return;
+        }
+        case "lk-copy":
+          navigator.clipboard?.writeText(tokenInfoText(W.tok)).then(() => toast("Token info copied"), () => toast("Copy failed"));
+          return;
+        case "wz-tax": Object.assign(openUpload.wz.f, { buyTax: a.dataset.b, sellTax: a.dataset.s }); return wzRender();
         case "wz-vdays": openUpload.wz.f.vestDays = a.dataset.v; return wzRender();
         case "wz-prem": openUpload.wz.f.premiereAt = dtLocal(Date.now() + +a.dataset.ms); return wzRender();
         case "wz-split-add": { const f = openUpload.wz.f; if (f.split.length < 5) f.split.push({ addr: "", pct: "" }); return wzRender(); }

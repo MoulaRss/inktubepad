@@ -857,3 +857,14 @@ body.side-mini .sidebar .mini-only { display: block; }
   .split-row { grid-template-columns: 1fr 80px auto; }
   .premiere-ov .cd { font-size: 32px; }
 }
+
+/* Listing kit (logo/header/links for DexScreener & GeckoTerminal) */
+.list-kit { margin-top: 12px; padding: 14px 16px; border-radius: 12px; background: var(--bg-elev-2); border: 1px solid rgba(113,50,245,.35); }
+.lk-h { display: flex; gap: 12px; margin-bottom: 12px; }
+.lk-h svg.i { flex: none; color: var(--ink-3); }
+.lk-h b { display: block; font-size: 15px; }
+.lk-h span { font-size: 13px; color: var(--text-2); }
+.lk-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.lk-row svg.i { width: 18px; height: 18px; }
+.lk-note { font-size: 12px; }
+#f-wlt { font-size: 12px; }
