@@ -791,7 +791,21 @@
     // and a v2 swap can cost a little more when mined than when estimated (time-dependent hook fee).
     async function send(c, method, args, extra = {}) {
       const ov = { ...(await fees()), ...extra };
-      const gas = await c[method].estimateGas(...args, ov);
+      let gas;
+      try {
+        gas = await c[method].estimateGas(...args, ov);
+      } catch (e) {
+        // An empty wallet makes the estimate fail with "missing revert data" / "gas required exceeds allowance":
+        // check the balance so the user sees the real reason instead.
+        const from = await signer?.getAddress().catch(() => null);
+        if (from) {
+          const bal = await rpc.getBalance(from).catch(() => null);
+          if (bal !== null && bal < (ov.value || 0n) + 400000n * ov.maxFeePerGas) {
+            throw new Error(`Not enough ETH on Ink to pay the gas (wallet ${from.slice(0, 6)}…${from.slice(-4)} has ${E.formatEther(bal)} ETH). Send a little ETH to it on Ink and try again.`);
+          }
+        }
+        throw e;
+      }
       return c[method](...args, { ...ov, gasLimit: gas + gas / 4n + 20000n });
     }
     // Hook rules are checked here too, so the wallet never opens for a swap that can only revert.
@@ -1576,6 +1590,8 @@
     if (rv) return rv;
     const m = e?.shortMessage || e?.info?.error?.message || e?.reason || e?.message || String(e);
     if (/user rejected|denied/i.test(m)) return "Transaction cancelled";
+    if (/insufficient funds|gas required exceeds allowance/i.test(m)) return "Not enough ETH on Ink to pay the gas";
+    if (/^Not enough ETH on Ink/.test(m)) return m;
     return m.length > 140 ? m.slice(0, 140) + "…" : m;
   }
   const progress = {

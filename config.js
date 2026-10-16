@@ -1,5 +1,5 @@
 // InkTube front-end config.
-// InkTube v2.1 (propriétaire 0x364f4C067450137dFf69c193c2cb2A9cF31d3Ab8). Anciennes factories v1 / v2 retirées (0 frais à récupérer).
+// InkTube v2.1 (propriétaire 0xd4487b37C03a1b032622596c2A45B3e27e10b4ce, déployé le 17/10/2026). Anciennes factories retirées du site.
 // Après `forge script script/Deploy.s.sol ...`, coller l'adresse + le bloc de déploiement ici.
 window.INKTUBE_CONFIG = {
   LAUNCHPAD_ADDRESS: "",
@@ -9,8 +9,8 @@ window.INKTUBE_CONFIG = {
   // Vide = mode v1 uniquement. Une fois `forge script script/DeployV2.s.sol ...` passé, coller
   // l'adresse du launchpad v2 + son bloc : les nouveaux lancements passent par v2, les tokens v1
   // restent affichés et se tradent toujours sur le v1.
-  LAUNCHPAD_V2: "0x9b6176DF81926714BE01bB958b01Bdbe2111617A",
-  DEPLOY_BLOCK_V2: 58679556,
+  LAUNCHPAD_V2: "0x38ea1Db0bCd2Df8Ac917459617d7E71382c8e6Ed",
+  DEPLOY_BLOCK_V2: 58690223,
 
   CHAIN_ID: 57073,
   CHAIN_NAME: "Ink",
