@@ -9,8 +9,8 @@ window.INKTUBE_CONFIG = {
   // Vide = mode v1 uniquement. Une fois `forge script script/DeployV2.s.sol ...` passé, coller
   // l'adresse du launchpad v2 + son bloc : les nouveaux lancements passent par v2, les tokens v1
   // restent affichés et se tradent toujours sur le v1.
-  LAUNCHPAD_V2: "",
-  DEPLOY_BLOCK_V2: 0,
+  LAUNCHPAD_V2: "0x639EdD2e994AFe430a23BA26291047A374e13b9B",
+  DEPLOY_BLOCK_V2: 58676915,
 
   CHAIN_ID: 57073,
   CHAIN_NAME: "Ink",
