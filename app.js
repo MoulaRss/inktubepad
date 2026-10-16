@@ -1648,6 +1648,7 @@
         </div>
         <div class="right">
           <button class="icon-btn mobile-only" data-act="search-open" aria-label="Search">${I.search}</button>
+          <a class="icon-btn x-link" href="${X_URL}" target="_blank" rel="noopener" title="Follow InkTube on X" aria-label="InkTube on X">${I.xlogo}</a>
           <button class="btn" data-act="upload">${I.add}<span class="create-label">Create</span></button>
           <div style="position:relative">
             <button class="icon-btn" data-act="notifs" aria-label="Notifications">${I.bell}<span class="dot" id="notif-dot" hidden></span></button>
@@ -1669,6 +1670,8 @@
     renderSidebar();
     renderAccount();
   }
+
+  const X_URL = "https://x.com/InkTube_";
 
   function renderSidebar() {
     const sb = $("#sidebar");
@@ -1713,6 +1716,7 @@
         <div style="margin-bottom:8px"><span class="lock-badge">${I.lock} LP locked forever</span></div>
         <b>Uniswap v4</b> · one-sided LP · no bonding curve · no price ceiling · starts at a <b>$3,000</b> market cap.<br>
         Network: <b>Ink</b> (${CFG.CHAIN_ID})<br>
+        <a class="x-follow" href="${X_URL}" target="_blank" rel="noopener">${I.xlogo}<span>Follow <b>@InkTube_</b> on X</span></a><br>
         <span style="opacity:.7">© 2026 InkTube</span>
       </div>`;
   }

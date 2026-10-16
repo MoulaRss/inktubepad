@@ -868,3 +868,10 @@ body.side-mini .sidebar .mini-only { display: block; }
 .lk-row svg.i { width: 18px; height: 18px; }
 .lk-note { font-size: 12px; }
 #f-wlt { font-size: 12px; }
+
+/* InkTube on X */
+a.icon-btn { color: var(--text); text-decoration: none; }
+.x-link svg.i { width: 20px; height: 20px; }
+.sidebar .foot .x-follow { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; color: var(--text-2); text-decoration: none; }
+.sidebar .foot .x-follow:hover { color: var(--text); }
+.sidebar .foot .x-follow svg.i { width: 14px; height: 14px; }
