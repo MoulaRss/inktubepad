@@ -2983,6 +2983,9 @@
 
   function wzRender() {
     const wz = openUpload.wz, f = wz.f, d = wzDerived();
+    // Re-rendering the step must not jump: keep the scroll position unless the step changed.
+    const modal = $(".modal.wz");
+    const keepScroll = modal && wz.renderedStep === wz.step ? modal.scrollTop : 0;
     $("#wz-steps").innerHTML = WZ_STEPS.map((s, i) => `<button class="wz-step ${i === wz.step ? "on" : ""} ${i < wz.step || i <= wz.maxStep ? "seen" : ""}" data-act="wz-goto" data-step="${i}" ${i > wz.maxStep ? "disabled" : ""}>
         <span class="dotc">${i < wz.step ? `<svg viewBox="0 0 24 24"><path d="${P.tick}"/></svg>` : ""}</span><span>${s}</span></button>`).join('<span class="wz-line"></span>');
 
@@ -3083,6 +3086,8 @@
     $("#wz-next").disabled = !wzValid(wz.step);
     $("#wz-note").textContent = wz.step === 3 ? "Signed in your wallet on Ink" : `Step ${wz.step + 1} of 4`;
     wzBind();
+    if (modal) modal.scrollTop = keepScroll;
+    wz.renderedStep = wz.step;
   }
 
   // Re-render the side preview + buttons without touching the inputs being typed in.
@@ -3096,7 +3101,7 @@
   function wzBind() {
     const wz = openUpload.wz, f = wz.f;
     const on = (sel, fn, ev = "input") => { const el = $(sel); if (el) el.addEventListener(ev, fn); };
-    const rerenderSoon = (() => { let t; return () => { clearTimeout(t); t = setTimeout(() => { const a = document.activeElement, id = a && a.id, pos = a && a.selectionStart; wzRender(); const el = id && $("#" + id); if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch {} } }, 350); }; })();
+    const rerenderSoon = (() => { let t; return () => { clearTimeout(t); t = setTimeout(() => { const a = document.activeElement, id = a && a.id, pos = a && a.selectionStart; wzRender(); const el = id && $("#" + id); if (el) { el.focus({ preventScroll: true }); try { el.setSelectionRange(pos, pos); } catch {} } }, 350); }; })();
     on("#f-name", (e) => { f.name = e.target.value; e.target.nextElementSibling.textContent = `${f.name.length}/64`; wzSoft(); });
     on("#f-sym", (e) => { f.symbol = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""); e.target.nextElementSibling.textContent = `${f.symbol.length}/16`; wzSoft(); rerenderSoon(); });
     on("#f-text", (e) => { f.text = e.target.value; const d = wzDerived(); const c = e.target.nextElementSibling; c.textContent = `${Math.max(0, 1000 - d.descBytes)} bytes left`; c.classList.toggle("down", d.descBytes > 1000); wzSoft(); });
@@ -3152,7 +3157,9 @@
       });
     });
     const first = $("#wz-pane input:not([type=hidden]):not([type=file]), #wz-pane textarea");
-    if (first && wz.step < 3 && !document.activeElement?.closest?.("#wz-pane")) first.focus();
+    // Auto-focus only when arriving on a step, never after clicking an option (it would scroll to the top).
+    if (first && wz.step < 3 && wz.focusedStep !== wz.step && !document.activeElement?.closest?.("#wz-pane")) first.focus({ preventScroll: true });
+    wz.focusedStep = wz.step;
   }
 
   async function wzEstimate() {
