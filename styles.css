@@ -290,7 +290,7 @@ main { margin-left: var(--side-w); padding-top: var(--top-h); min-height: 100vh;
 @keyframes shimmer { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
 
 .empty { padding: 80px 20px; text-align: center; color: var(--text-2); display: grid; place-items: center; gap: 12px; }
-.empty svg.i { width: 96px; height: 96px; opacity: 0.3; }
+.empty > svg.i { width: 96px; height: 96px; opacity: 0.3; }
 .empty h3 { color: var(--text); margin: 0; font-weight: 500; font-size: 20px; }
 
 .section-title { display: flex; align-items: center; gap: 10px; margin: 24px 0 16px; font-size: 20px; font-weight: 700; }
